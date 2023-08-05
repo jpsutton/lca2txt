@@ -1,21 +1,23 @@
 #!/usr/bin/env python3
 
+import os
 import re
 import sys
 import gzip
 import struct
 import datetime
+import pysyslogclient
 
-from pprint import pprint
 from dateutil import parser as dateparser
 from mlargparser import MLArgParser
 
+# noinspection PyProtectedMember
 # This is modified from gzip._read_gzip_header
 def get_gzip_headers(fp):
-    ''' Extract the original filename, comment, and last modify time of a given gzip file pointer '''
+    """ Extract the original filename, comment, and last modify time of a given gzip file pointer """
 
     # Compatibility class for use with gzip._GzipReader._read_exact
-    class fp_wrapper():
+    class fp_wrapper:
         _fp = None
 
     orig_filename, comment, last_mtime = None, None, None
@@ -28,12 +30,12 @@ def get_gzip_headers(fp):
         return None
 
     if magic != b'\037\213':
-        raise BadGzipFile('Not a gzipped file (%r)' % magic)
+        raise gzip.BadGzipFile('Not a gzipped file (%r)' % magic)
 
     (method, flag, last_mtime) = struct.unpack("<BBIxx", gzip._GzipReader._read_exact(wrapped_fp, 8))
 
     if method != 8:
-        raise BadGzipFile('Unknown compression method')
+        raise gzip.BadGzipFile('Unknown compression method')
 
     if flag & gzip.FEXTRA:
         # Read & discard the extra field, if present
@@ -71,16 +73,16 @@ def get_gzip_headers(fp):
 
 
 def ticks2datetime(ticks: int):
-    ''' Convert a .NET Datetime.Ticks value (very larget integer) to a Python DateTime object '''
+    """ Convert a .NET Datetime.Ticks value (very larget integer) to a Python DateTime object """
     return datetime.datetime(1, 1, 1) + datetime.timedelta(microseconds = ticks / 10)
 
 
-def get_archive_params(archive_filename):
-    ''' Read the archive paramters from the gzip comment '''
+def get_archive_params(archive):
+    """ Read the archive paramters from the gzip comment """
 
     attribs = dict()
 
-    with open(archive_filename, "rb") as gzfile:
+    with open(archive, "rb") as gzfile:
         orig_filename, comment, last_mtime = get_gzip_headers(gzfile)
 
     if comment is None:
@@ -93,9 +95,8 @@ def get_archive_params(archive_filename):
         print("ERROR: this doesn't appear to be a LogRhythm archive file.", file=sys.stderr)
         sys.exit(2)
 
-    major_version, minor_version, revision = [int(i) for i in m.groups()]
-    attribs['majversion'], attribs['minversion'], attribs['revision'] = major_version, minor_version, revision
-    major_minor = major_version, minor_version
+    attribs['majversion'], attribs['minversion'], attribs['revision'] = [int(i) for i in m.groups()]
+    major_minor = attribs['majversion'], attribs['minversion']
 
     if major_minor in ((3, 6), (4, 0), (5, 0)):
         m = re.match(r"^LogRhythm Archive Version=(\d+)\.(\d+)\.(\d+) MasterLicenseID=(\d+) ArchiveGUID=(\S+) MsgSourceID=(\d+) HostID=(\d+) NormalMsgDate=(\d+) MediatorID=(\d+) CreationTicks=(\d+)", comment)
@@ -123,7 +124,10 @@ def get_archive_params(archive_filename):
 
 
 def read_7bit_encoded_int(fp):
-    ''' Reimplementation of Read7BitEncodedInt() from https://github.com/microsoft/referencesource/blob/master/mscorlib/system/io/binaryreader.cs '''
+    """ 
+    Reimplementation of Read7BitEncodedInt() from 
+    https://github.com/microsoft/referencesource/blob/master/mscorlib/system/io/binaryreader.cs
+    """
 
     count = 0
     shift = 0
@@ -143,7 +147,7 @@ def read_7bit_encoded_int(fp):
 
 
 def read_length_prefixed_string(fp):
-    ''' Read a .NET-style length-prefixed string from a given file handle opened in binary mode '''
+    """ Read a .NET-style length-prefixed string from a given file handle opened in binary mode """
     length = read_7bit_encoded_int(fp)
     s = fp.read(length)
     return s.decode("UTF-8")
@@ -153,29 +157,35 @@ class Lca2txt(MLArgParser):
     """ Convert compressed LogRhythm archive files to plain text """
 
     argDesc = {
-        'archive_filename': "Name of the archive to act on",
+        'archive': "Name of the archive to act on",
         'normal_msg_date': "Prefix each log entry with the NormalMsgDate",
         'server': "Hostname or IP address of a syslog server",
         'port': "Port of a syslog server",
         'protocol': "Protocol (TCP or UDP) to use when connecting to the syslog server; defaults to UDP",
     }
 
-    def _dump(self, archive_filename: str, normal_msg_date: bool = False):
+    # noinspection PyMethodMayBeStatic
+    def _dump(self, archive: str, normal_msg_date: bool = False):
         """ Yield each line of log data to the caller """
 
-        archive_params = get_archive_params(archive_filename)
+        if not os.path.exists(archive):
+            print(f"ERROR: {archive} does not exist.", file=sys.stderr)
+            sys.exit(4)
+
+
+        archive_params = get_archive_params(archive)
         major_minor = (archive_params['majversion'], archive_params['minversion'])
 
-        with gzip.open(archive_filename, "rb") as binary_reader:
+        with gzip.open(archive, "rb") as decompressed:
             # Read and discard the header portion of the file (differs based on archive version)
             if major_minor in ((2, 2), (3, 0)):
-                binary_reader.read(32)
-                read_length_prefixed_string(binary_reader)
+                decompressed.read(32)
+                read_length_prefixed_string(decompressed)
             elif major_minor in ((3, 6), (4, 0), (5, 0)):
-                binary_reader.read(16)
-                read_length_prefixed_string(binary_reader)
-                binary_reader.read(28)
-                read_length_prefixed_string(binary_reader)
+                decompressed.read(16)
+                read_length_prefixed_string(decompressed)
+                decompressed.read(28)
+                read_length_prefixed_string(decompressed)
 
             if normal_msg_date and archive_params['majversion'] < 5:
                 print("WARN: --normal-msg-date/-n has no effect on archives prior to version 5", file=sys.stderr)
@@ -186,7 +196,7 @@ class Lca2txt(MLArgParser):
 
                     # Read the NormalMsgDate for each line (only on version 5 archive files)
                     if archive_params['majversion'] >= 5:
-                        ticks_raw = binary_reader.read(8)
+                        ticks_raw = decompressed.read(8)
 
                         # End of file
                         if len(ticks_raw) < 8:
@@ -198,21 +208,21 @@ class Lca2txt(MLArgParser):
                         sys.stdout.write(f"{ticks2datetime(ticks).isoformat()},")
 
                     # Read and discard line-specific metadata
-                    binary_reader.read(30)
-                    yield read_length_prefixed_string(binary_reader)
+                    decompressed.read(30)
+                    yield read_length_prefixed_string(decompressed)
 
                 except EOFError:
                     break
 
 
-    def dump(self, archive_filename: str, normal_msg_date: bool = False):
+    def dump(self, archive: str, normal_msg_date: bool = False):
         """ Dump each line of log data to standard output """
 
-        for line in self._dump(archive_filename, normal_msg_date):
+        for line in self._dump(archive, normal_msg_date):
             print(line)
 
 
-    def relay(self, archive_filename: str, server: str, port: int, protocol: str = "UDP", normal_msg_date: bool = False):
+    def relay(self, archive: str, server: str, port: int, protocol: str = "UDP", normal_msg_date: bool = False):
         """ Relay each line of log data to a syslog server """
 
         protocol = protocol.upper()
@@ -223,7 +233,7 @@ class Lca2txt(MLArgParser):
 
         client = pysyslogclient.SyslogClientRFC5424(server, port, proto=protocol)
 
-        for line in self._dump(archive_filename, normal_msg_date):
+        for line in self._dump(archive, normal_msg_date):
             client.log(line, program="lca2txt")
 
 if __name__ == '__main__':
