@@ -223,7 +223,7 @@ class Lca2txt(MLArgParser):
 
         client = pysyslogclient.SyslogClientRFC5424(server, port, proto=protocol)
 
-        for line in self.dump(archive_filename, normal_msg_date):
+        for line in self._dump(archive_filename, normal_msg_date):
             client.log(line, program="lca2txt")
 
 if __name__ == '__main__':
